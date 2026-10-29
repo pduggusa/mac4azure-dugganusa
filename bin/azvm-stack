@@ -30,11 +30,12 @@ if [ -n "$VM" ]; then
   need az jq
   m4a_require_subscription; m4a_resolve_vm
   echo; echo "== 0. Cloud: what Azure says about $VM =="
-  az_ vm show -g "$RG" -n "$VM" -o json 2>/dev/null > /tmp/m4a-stack-$$.json || die "could not read the VM"
-  jq -r '"size: \(.hardwareProfile.vmSize)   region: \(.location)   zones: \(.zones // ["none"] | join(","))"' /tmp/m4a-stack-$$.json
-  jq -r '"OS disk: \(.storageProfile.osDisk.managedDisk.storageAccountType // "?"), \(.storageProfile.osDisk.diskSizeGb // "?") GB, caching \(.storageProfile.osDisk.caching // "?")"' /tmp/m4a-stack-$$.json
-  jq -r '.storageProfile.dataDisks[]? | "data disk LUN \(.lun): \(.managedDisk.storageAccountType // "?"), \(.diskSizeGb // "?") GB, caching \(.caching // "?")"' /tmp/m4a-stack-$$.json
-  rm -f /tmp/m4a-stack-$$.json
+  # The JSON stays in a shell variable: no temp file, so no predictable path to race or symlink.
+  VMJSON=$(az_ vm show -g "$RG" -n "$VM" -o json 2>/dev/null) || die "could not read the VM"
+  printf '%s' "$VMJSON" | jq -r '"size: \(.hardwareProfile.vmSize)   region: \(.location)   zones: \(.zones // ["none"] | join(","))"'
+  printf '%s' "$VMJSON" | jq -r '"OS disk: \(.storageProfile.osDisk.managedDisk.storageAccountType // "?"), \(.storageProfile.osDisk.diskSizeGb // "?") GB, caching \(.storageProfile.osDisk.caching // "?")"'
+  printf '%s' "$VMJSON" | jq -r '.storageProfile.dataDisks[]? | "data disk LUN \(.lun): \(.managedDisk.storageAccountType // "?"), \(.diskSizeGb // "?") GB, caching \(.caching // "?")"'
+  unset VMJSON
   echo; "$HERE/bin/azvm-metrics" --vm "$VM" --resource-group "$RG" --subscription "$SUB" --hours 3 2>&1 | head -10
 fi
 

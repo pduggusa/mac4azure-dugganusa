@@ -3,7 +3,7 @@
 #
 #   azmac-doctor [--no-network] [--ab]
 #     --ab  also run a fair A/B of az through the system proxy vs bypassing it: 12 calls each, ALTERNATING so both paths see the
-#           same network conditions, with the shape of any error. Needs az signed in. Read-only (lists subscriptions, prints a count).
+#           same network conditions, with the CLASS of any error (proxy-error, connection-reset, timeout...), never its text. Needs az signed in. Read-only (lists subscriptions, prints a count).
 #
 # Checks, from the metal up: the hardware you are on, whether it is a hardened admin workstation (disk encryption, SIP,
 # Gatekeeper, firewall, token-cache permissions), the network path to Azure's control plane (resolvers, proxies, and
@@ -12,6 +12,22 @@
 # Privacy: it prints no serial number, hardware UUID, MAC address, subscription id, account name or key. Safe to paste.
 # Exit: always 0; WARN/FAIL lines say what to look at.
 set -u
+# classify() maps an error's free text to a short CLASS. The doctor prints classes only, never the text: az error messages can carry
+# account names, tenant names, URLs or ids, and this output is meant to be safe to paste.
+classify() {
+  local l; l=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  case "$l" in
+    *"unable to connect to proxy"*|*proxyerror*)                                        echo "proxy-error";;
+    *remotedisconnected*|*"connection aborted"*|*"connection reset"*)                  echo "connection-reset";;
+    *"failed to establish"*|*"name or service not known"*|*"nodename nor servname"*|*"no route to host"*|*"network is unreachable"*) echo "connect-failed";;
+    *"timed out"*|*timeout*)                                                           echo "timeout";;
+    *aadsts[0-9]*)                                                                     echo "aad-$(printf '%s' "$l" | grep -oE 'aadsts[0-9]+' | head -1)";;
+    *"az login"*|*"not logged in"*|*"please run 'az login'"*)                          echo "not-signed-in";;
+    *)                                                                                 echo "other";;
+  esac
+}
+[ "${1:-}" = "--classify" ] && { classify "${2:-}"; exit 0; }   # test hook: prints the class of the given text
+
 NET=1; AB=0
 for a in "$@"; do case "$a" in --no-network) NET=0;; --ab) AB=1;; esac; done
 P=0; W=0; F=0
@@ -85,12 +101,11 @@ if [ "$AB" = 1 ]; then
   else
     URL="https://management.azure.com/subscriptions?api-version=2020-01-01"
     pa=0; pf=0; ba=0; bf=0; perr=""; berr=""
-    shape() { tr '\n' ' ' | sed -E 's/[0-9a-f]{8}-[0-9a-f-]{27}/<id>/g' | cut -c1-80; }
     for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
       if out=$(az rest --method get --url "$URL" --query "length(value)" -o none 2>&1); then pa=$((pa+1)); else pf=$((pf+1)); perr="$perr
-      $(printf '%s' "$out" | shape)"; fi
+      $(classify "$out")"; fi
       if out=$(NO_PROXY=management.azure.com,login.microsoftonline.com az rest --method get --url "$URL" --query "length(value)" -o none 2>&1); then ba=$((ba+1)); else bf=$((bf+1)); berr="$berr
-      $(printf '%s' "$out" | shape)"; fi
+      $(classify "$out")"; fi
     done
     info "through the proxy as configured: $pa ok, $pf failed"; [ -n "$perr" ] && printf '%s\n' "$perr" | sort | uniq -c | sort -rn | head -3 | sed 's/^/        /'
     info "proxy bypassed for Azure hosts:  $ba ok, $bf failed"; [ -n "$berr" ] && printf '%s\n' "$berr" | sort | uniq -c | sort -rn | head -3 | sed 's/^/        /'

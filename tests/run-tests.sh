@@ -53,6 +53,13 @@ cp -R hardware /tmp/m4a-hw-test.$$ && printf '\n# x' >> /tmp/m4a-hw-test.$$/ladd
 expect "azvm-stack refuses a missing --host" 1 bin/azvm-stack
 expect "azvm-stack refuses a malformed --host" 1 bin/azvm-stack --host "a b;rm -rf"
 if [ "$(uname -s)" = Darwin ]; then expect "azmac-doctor runs and exits 0 (no network)" 0 bin/azmac-doctor --no-network; fi
+echo "privacy: the doctor prints error CLASSES, never error text"
+cls() { bin/azmac-doctor --classify "$1" 2>/dev/null; }
+[ "$(cls "ProxyError('Unable to connect to proxy')")" = proxy-error ] && ok "proxy failure classified" || bad "proxy failure not classified"
+[ "$(cls "AADSTS70043 expired for alice@contoso.com in tenant Contoso")" = aad-aadsts70043 ] && ok "an AADSTS error yields only its code" || bad "AADSTS classification"
+out=$(cls "Please run az login for jane.doe@example.org tenant ACME-Corp"); case "$out" in *@*|*ACME*|*jane*) bad "class output leaked a name: $out";; *) ok "no email or tenant name can appear in a class";; esac
+grep -q '/tmp/' bin/azvm-stack && bad "azvm-stack uses a predictable /tmp path" || ok "azvm-stack uses no predictable temp path"
+
 
 echo "policy files are valid JSON"
 for f in policy/definitions/*.json policy/*.json; do [ -f "$f" ] || continue; jq -e . "$f" >/dev/null 2>&1 && ok "$f" || bad "$f"; done

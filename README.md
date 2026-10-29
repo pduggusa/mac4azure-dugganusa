@@ -65,7 +65,7 @@ There is no bypass flag. The emergency path is a human using `az` directly under
 
 ## Honest status
 
-Read-only paths, the dry runs and the refusal behavior were exercised against a real subscription. The offline test suite (`tests/run-tests.sh`, 44 checks) covers the gate. The `--apply` paths mirror a manual runbook we executed once on a production VM, but **the scripted apply paths have not been run end to end**, and the ServiceNow client and the policy creation have **not** been run against a live instance or subscription. Details and the full list are in [docs/TESTED-VERSIONS.md](docs/TESTED-VERSIONS.md). Try applies on a non-production VM first.
+Read-only paths, the dry runs and the refusal behavior were exercised against a real subscription. The offline test suite (`tests/run-tests.sh`, 48 checks) covers the gate. The `--apply` paths mirror a manual runbook we executed once on a production VM, but **the scripted apply paths have not been run end to end**, and the ServiceNow client and the policy creation have **not** been run against a live instance or subscription. Details and the full list are in [docs/TESTED-VERSIONS.md](docs/TESTED-VERSIONS.md). Try applies on a non-production VM first.
 
 ## License
 

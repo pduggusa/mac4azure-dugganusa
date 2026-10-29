@@ -1,0 +1,104 @@
+#!/bin/bash
+# azmac-doctor — is THIS Mac a sound place to run Azure changes from? Read-only. No sudo. Local.
+#
+#   azmac-doctor [--no-network] [--ab]
+#     --ab  also run a fair A/B of az through the system proxy vs bypassing it: 12 calls each, ALTERNATING so both paths see the
+#           same network conditions, with the shape of any error. Needs az signed in. Read-only (lists subscriptions, prints a count).
+#
+# Checks, from the metal up: the hardware you are on, whether it is a hardened admin workstation (disk encryption, SIP,
+# Gatekeeper, firewall, token-cache permissions), the network path to Azure's control plane (resolvers, proxies, and
+# five timed attempts per endpoint, because intermittent failure is what makes az calls fail silently), the clock
+# (Entra rejects tokens with a skewed clock), and power/thermal state (a throttled laptop mid-change is a bad day).
+# Privacy: it prints no serial number, hardware UUID, MAC address, subscription id, account name or key. Safe to paste.
+# Exit: always 0; WARN/FAIL lines say what to look at.
+set -u
+NET=1; AB=0
+for a in "$@"; do case "$a" in --no-network) NET=0;; --ab) AB=1;; esac; done
+P=0; W=0; F=0
+pass() { P=$((P+1)); printf '  [PASS] %s\n' "$*"; }
+warn() { W=$((W+1)); printf '  [WARN] %s\n' "$*"; }
+fail() { F=$((F+1)); printf '  [FAIL] %s\n' "$*"; }
+info() { printf '  [INFO] %s\n' "$*"; }
+[ "$(uname -s)" = Darwin ] || { echo "azmac-doctor is for macOS (this is $(uname -s))"; exit 0; }
+
+echo "Hardware"
+MODEL=$(sysctl -n hw.model 2>/dev/null); CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+MEMGB=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
+info "$MODEL, $CHIP, $(sysctl -n hw.ncpu 2>/dev/null) cores, ${MEMGB} GB, macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)), $(uname -m)"
+[ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = 1 ] && warn "this shell runs under Rosetta (x86 translation); native Apple-silicon tools are faster and better supported" || pass "native architecture (no Rosetta translation)"
+
+echo "Workstation posture"
+fdesetup status 2>/dev/null | grep -q "FileVault is On" && pass "FileVault disk encryption is on" || warn "FileVault is not reported On (a lost laptop is a lost ~/.azure token cache)"
+csrutil status 2>/dev/null | grep -qi "enabled" && pass "System Integrity Protection is enabled" || warn "System Integrity Protection is not enabled"
+spctl --status 2>/dev/null | grep -qi "enabled" && pass "Gatekeeper is enabled" || warn "Gatekeeper is not enabled"
+/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null | grep -qi "enabled" && pass "application firewall is on" || warn "application firewall is off (inbound connections to this Mac are not filtered)"
+if [ "$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticCheckEnabled 2>/dev/null)" = 1 ]; then pass "automatic update checks are on"; else info "automatic update checks: not reported on"; fi
+CFG="${AZURE_CONFIG_DIR:-$HOME/.azure}"
+if [ -d "$CFG" ]; then
+  MODE=$(stat -f %Lp "$CFG" 2>/dev/null)
+  [ $(( 8#$MODE & 8#077 )) -eq 0 ] && pass "Azure CLI config dir is private (mode $MODE)" || warn "Azure CLI config dir is readable by others (mode $MODE): chmod 700 it. It holds your token cache"
+else info "no Azure CLI config dir yet (not signed in)"; fi
+[ -n "${AZURE_CONFIG_DIR:-}" ] && info "AZURE_CONFIG_DIR is set: good for keeping one tenant per profile" || info "AZURE_CONFIG_DIR is not set: one shared profile for every tenant"
+NK=$(ssh-add -l 2>/dev/null | grep -c SHA256); info "ssh-agent holds $NK key(s)"
+if command -v az >/dev/null 2>&1; then
+  info "Azure CLI $(az version --query '"azure-cli"' -o tsv 2>/dev/null)"
+  az account show -o none >/dev/null 2>&1 && pass "signed in to Azure (account details not shown)" || info "not signed in to Azure (run az login)"
+else info "Azure CLI not installed"; fi
+
+echo "Network path to Azure"
+NR=$(scutil --dns 2>/dev/null | awk '/nameserver\[[0-9]+\]/ {print $3}' | sort -u | wc -l | tr -d ' '); info "$NR distinct DNS resolver(s) configured"
+PX=$(scutil --proxy 2>/dev/null | awk '/(HTTPEnable|HTTPSEnable|SOCKSEnable|ProxyAutoConfigEnable) : 1/ {gsub(/Enable.*/,"",$1); printf "%s ", $1}')
+if [ -n "$PX" ]; then
+  PHOST=$(scutil --proxy 2>/dev/null | awk '/HTTPSProxy :/ {print $3}'); PPORT=$(scutil --proxy 2>/dev/null | awk '/HTTPSPort :/ {print $3}')
+  case "$PHOST" in
+    127.*|localhost) PROC=$(lsof -nP -iTCP:"$PPORT" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1; exit}'); warn "system proxy enabled for ${PX}: a LOCAL app on this Mac (listener process: ${PROC:-unknown}). Python-based az honors it; curl does not. Measure it with: azmac-doctor --ab";;
+    *) warn "system proxy enabled for ${PX}(remote or network proxy). Python-based az honors it; curl does not. Measure it with: azmac-doctor --ab";;
+  esac
+else pass "no system proxy configured"; fi
+ENVPX=""; for v in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do eval "[ -n \"\${$v:-}\" ]" && ENVPX="$ENVPX $v"; done
+[ -n "$ENVPX" ] && warn "proxy environment variable(s) set:$ENVPX" || pass "no proxy environment variables"
+if [ "$NET" = 1 ]; then
+  for H in management.azure.com login.microsoftonline.com graph.microsoft.com prices.azure.com; do
+    OK=0; TS=""
+    for i in 1 2 3 4 5; do
+      OUT=$(curl -s -o /dev/null -m 8 -w '%{http_code} %{time_total}' "https://$H/" 2>/dev/null); CODE=${OUT%% *}
+      if [ -n "$CODE" ] && [ "$CODE" != 000 ]; then OK=$((OK+1)); TS="$TS${OUT##* }
+"; fi
+    done
+    MED=$(printf '%s' "$TS" | grep . | sort -n | awk '{a[NR]=$1} END {if (NR) printf "%d", a[int((NR+1)/2)]*1000; else print "-"}')
+    if [ "$OK" = 5 ]; then pass "$H: 5/5 reachable, median ${MED} ms"; elif [ "$OK" = 0 ]; then fail "$H: 0/5 reachable"; else warn "$H: only $OK/5 reachable, median ${MED} ms: intermittent. This is what makes az calls fail silently (our tools retry once and report LOOKUP FAILED)"; fi
+  done
+  SK=$(sntp -t 5 time.apple.com 2>/dev/null | awk 'NR>=1 && $1 ~ /^[+-][0-9.]+$/ {print $1; exit}')
+  if [ -n "$SK" ]; then awk -v s="$SK" 'BEGIN{ if (s<0) s=-s; exit !(s>30) }' && warn "clock is ${SK}s off network time: Entra token validation is sensitive to skew" || pass "clock within 30 s of network time (offset ${SK}s)"; else info "clock skew not measured (sntp unavailable or blocked)"; fi
+else info "network checks skipped (--no-network)"; fi
+
+echo "Power and thermal"
+BAT=$(pmset -g batt 2>/dev/null | head -2 | tr '\n' ' ')
+echo "$BAT" | grep -q "AC Power" && pass "on AC power" || warn "on battery: do not start a change window unplugged"
+pmset -g 2>/dev/null | grep -qE "lowpowermode +1" && warn "Low Power Mode is on (background networking is reduced)" || pass "Low Power Mode is off"
+TH=$(pmset -g therm 2>/dev/null | grep -E "CPU_Speed_Limit" | awk '{print $NF}')
+if [ -n "$TH" ] && [ "$TH" -lt 100 ] 2>/dev/null; then warn "CPU is thermally throttled to ${TH}%"; else pass "no thermal throttling reported"; fi
+
+if [ "$AB" = 1 ]; then
+  echo; echo "az through the proxy vs bypassing it (alternating, 12 each)"
+  if ! command -v az >/dev/null 2>&1 || ! az account show -o none >/dev/null 2>&1; then info "needs az installed and signed in; skipped"
+  else
+    URL="https://management.azure.com/subscriptions?api-version=2020-01-01"
+    pa=0; pf=0; ba=0; bf=0; perr=""; berr=""
+    shape() { tr '\n' ' ' | sed -E 's/[0-9a-f]{8}-[0-9a-f-]{27}/<id>/g' | cut -c1-80; }
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+      if out=$(az rest --method get --url "$URL" --query "length(value)" -o none 2>&1); then pa=$((pa+1)); else pf=$((pf+1)); perr="$perr
+      $(printf '%s' "$out" | shape)"; fi
+      if out=$(NO_PROXY=management.azure.com,login.microsoftonline.com az rest --method get --url "$URL" --query "length(value)" -o none 2>&1); then ba=$((ba+1)); else bf=$((bf+1)); berr="$berr
+      $(printf '%s' "$out" | shape)"; fi
+    done
+    info "through the proxy as configured: $pa ok, $pf failed"; [ -n "$perr" ] && printf '%s\n' "$perr" | sort | uniq -c | sort -rn | head -3 | sed 's/^/        /'
+    info "proxy bypassed for Azure hosts:  $ba ok, $bf failed"; [ -n "$berr" ] && printf '%s\n' "$berr" | sort | uniq -c | sort -rn | head -3 | sed 's/^/        /'
+    if [ "$pf" -gt 0 ] && [ "$bf" -eq 0 ]; then warn "failures only through the proxy: the proxy app is the flaky component"
+    elif [ "$bf" -gt 0 ] && [ "$pf" -eq 0 ]; then warn "failures only when bypassing the proxy: the proxy is load-bearing here; do not turn it off"
+    elif [ "$pf" -gt 0 ] && [ "$bf" -gt 0 ]; then warn "both paths fail sometimes: the cause is upstream of the proxy (network, DNS, or Azure)"
+    else pass "both paths 12/12: no evidence the proxy is a problem in this sample"; fi
+  fi
+fi
+
+echo; printf 'Result: %s pass, %s warn, %s fail\n' $P $W $F

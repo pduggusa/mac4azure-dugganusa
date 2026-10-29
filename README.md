@@ -11,6 +11,8 @@ It exists because of one measurement. On a VM we run, the disks averaged single 
 | `bin/azvm-metrics` | Which layer is at its ceiling: VM-level disk caps, disk caps, CPU, last N hours | no |
 | `bin/azvm-sizes` | Compare candidate sizes: vCPU, memory, disk IOPS and MB/s, temp disk, quota headroom, retail price | no |
 | `bin/azvm-preflight` | Every check you want green before a resize: generation, static IP, locks, quota, temp disk, controller type | no |
+| `bin/azmac-doctor` | Is this Mac a sound place to run Azure changes from? Hardware, posture, network path to Azure, clock, power. `--ab` measures the system proxy fairly | no |
+| `bin/azvm-stack` | Walk a VM from Azure's limits down to its block devices, read-only, with a checksum-verified script | no |
 | `bin/azvm-gate` | Ask the change gate "may this run now?" Exit codes are a contract for workflows | no |
 | `bin/azvm-snapshot` | Incremental snapshots of every disk, with a restore test | **dry run by default** |
 | `bin/azvm-resize` | Preflight, gate, snapshot, resize, verify, print the rollback | **dry run by default** |
@@ -53,6 +55,7 @@ There is no bypass flag. The emergency path is a human using `az` directly under
 - [docs/SERVICENOW.md](docs/SERVICENOW.md) and [docs/MAINTENANCE-WINDOWS.md](docs/MAINTENANCE-WINDOWS.md): plugging into change management
 - [docs/POLICIES.md](docs/POLICIES.md): the process as Azure Policy
 - [docs/LESSONS.md](docs/LESSONS.md): the traps we hit (ephemeral temp disks, mount order, quota, caps)
+- [docs/HARDWARE-LADDER.md](docs/HARDWARE-LADDER.md): from Azure's limit down to the block device, rung by rung
 - [docs/CLAUDE-HOWTO.md](docs/CLAUDE-HOWTO.md) and [CLAUDE.md](CLAUDE.md): driving this with Claude Code safely
 
 ## Background reading
@@ -62,7 +65,7 @@ There is no bypass flag. The emergency path is a human using `az` directly under
 
 ## Honest status
 
-Read-only paths, the dry runs and the refusal behavior were exercised against a real subscription. The offline test suite (`tests/run-tests.sh`, 36 checks) covers the gate. The `--apply` paths mirror a manual runbook we executed once on a production VM, but **the scripted apply paths have not been run end to end**, and the ServiceNow client and the policy creation have **not** been run against a live instance or subscription. Details and the full list are in [docs/TESTED-VERSIONS.md](docs/TESTED-VERSIONS.md). Try applies on a non-production VM first.
+Read-only paths, the dry runs and the refusal behavior were exercised against a real subscription. The offline test suite (`tests/run-tests.sh`, 44 checks) covers the gate. The `--apply` paths mirror a manual runbook we executed once on a production VM, but **the scripted apply paths have not been run end to end**, and the ServiceNow client and the policy creation have **not** been run against a live instance or subscription. Details and the full list are in [docs/TESTED-VERSIONS.md](docs/TESTED-VERSIONS.md). Try applies on a non-production VM first.
 
 ## License
 

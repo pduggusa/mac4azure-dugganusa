@@ -1,0 +1,42 @@
+#!/bin/bash
+# azvm-stack — walk a VM from Azure's limits down to its block devices. Read-only.
+#
+#   azvm-stack --host azureuser@203.0.113.10 [--vm my-vm --subscription S [--resource-group rg]]
+#
+# Cloud rung (needs --vm, Reader + Monitoring Reader): VM size, each disk's SKU, size and LUN, and which VM-level or disk-level limit
+# is being hit (azvm-metrics). Guest rung (needs ssh access you already have): hardware/ladder.sh, a FIXED read-only script. The tool
+# refuses to send it unless its sha256 matches hardware/MANIFEST.sha256, so a tampered copy of this repo cannot run something else on
+# your VM. It prints no environment, process arguments or file contents. See docs/HARDWARE-LADDER.md for what each rung proves.
+. "$(dirname "$0")/../lib/common.sh"
+need ssh shasum
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+
+HOST=""; VM=""; RG=""; SUB=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host) HOST="$2"; shift 2;; --vm) VM="$2"; shift 2;; --resource-group|-g) RG="$2"; shift 2;; --subscription) SUB="$2"; shift 2;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) die "unknown option: $1";;
+  esac
+done
+[ -n "$HOST" ] || die "--host user@address is required (the tool never guesses where to connect)"
+printf '%s' "$HOST" | grep -Eq '^[A-Za-z0-9_.-]+@[A-Za-z0-9_.:-]+$' || die "--host must look like user@address"
+
+echo "Verifying the script before sending it..."
+( cd "$HERE/hardware" && shasum -a 256 -c MANIFEST.sha256 >/dev/null 2>&1 ) || die "hardware/ladder.sh does not match hardware/MANIFEST.sha256: refusing to send it"
+echo "  ladder.sh matches its manifest ($(cut -c1-12 "$HERE/hardware/MANIFEST.sha256"))."
+
+if [ -n "$VM" ]; then
+  need az jq
+  m4a_require_subscription; m4a_resolve_vm
+  echo; echo "== 0. Cloud: what Azure says about $VM =="
+  az_ vm show -g "$RG" -n "$VM" -o json 2>/dev/null > /tmp/m4a-stack-$$.json || die "could not read the VM"
+  jq -r '"size: \(.hardwareProfile.vmSize)   region: \(.location)   zones: \(.zones // ["none"] | join(","))"' /tmp/m4a-stack-$$.json
+  jq -r '"OS disk: \(.storageProfile.osDisk.managedDisk.storageAccountType // "?"), \(.storageProfile.osDisk.diskSizeGb // "?") GB, caching \(.storageProfile.osDisk.caching // "?")"' /tmp/m4a-stack-$$.json
+  jq -r '.storageProfile.dataDisks[]? | "data disk LUN \(.lun): \(.managedDisk.storageAccountType // "?"), \(.diskSizeGb // "?") GB, caching \(.caching // "?")"' /tmp/m4a-stack-$$.json
+  rm -f /tmp/m4a-stack-$$.json
+  echo; "$HERE/bin/azvm-metrics" --vm "$VM" --resource-group "$RG" --subscription "$SUB" --hours 3 2>&1 | head -10
+fi
+
+echo; echo "== Guest: sending hardware/ladder.sh to $HOST (read-only) =="
+ssh -o BatchMode=yes -o ConnectTimeout=20 "$HOST" 'bash -s' < "$HERE/hardware/ladder.sh"

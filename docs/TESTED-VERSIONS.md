@@ -27,6 +27,8 @@ Against a real subscription and a real production VM, **read-only**:
 - `azvm-snapshot`, `azvm-quota request`, `azvm-resize`, `azvm-policy`: **dry runs only**, including `azvm-resize --apply` correctly refusing on a failed preflight and a denied gate.
 - The Azure Policy rule fields were checked against the live resource-provider alias lists (`Microsoft.Compute/virtualMachines/sku.name`, `Microsoft.Network/publicIPAddresses/publicIPAllocationMethod`).
 
+New in 0.2.0, run for real on 2026-10-29: `azmac-doctor` (with and without `--ab`) on the machine above, where it found a system proxy and a world-readable Azure CLI config directory, and a fair alternating test cleared the proxy (12 of 12 on both paths); `azvm-stack` against the production VM over ssh, read-only, where it found I/O pressure while the disks looked idle and 14 GB hiding under a mount point on the OS disk. `azmac-doctor` is macOS only. `azvm-stack` was run against Ubuntu 22.04 only; the other distributions' `/dev/disk/azure` links are assumed, not verified.
+
 Offline, no Azure and no network: `tests/run-tests.sh` (the change gate in all three providers, window edges, host allow-list, JSON contract, policy JSON validity, `bash -n` on every script).
 
 ## What we did NOT test

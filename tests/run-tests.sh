@@ -15,7 +15,7 @@ IN=$(epoch 2026-11-03T03:00:00Z); BEFORE=$(epoch 2026-11-03T01:00:00Z); AFTER=$(
 F=tests/fixtures/change-ok.json; S=tests/fixtures/snow-ok.json
 
 echo "syntax"
-for f in bin/* lib/*.sh tests/*.sh; do bash -n "$f" 2>/dev/null && ok "bash -n $f" || bad "bash -n $f"; done
+for f in bin/* lib/*.sh tests/*.sh hardware/ladder.sh; do bash -n "$f" 2>/dev/null && ok "bash -n $f" || bad "bash -n $f"; done
 
 echo "gate: none provider"
 expect "denies mutating action with no change control" 10 env GATE_PROVIDER=none $GATE check --action resize --vm example-vm
@@ -46,6 +46,13 @@ expect "refuses a host outside *.service-now.com"               10 env GATE_PROV
 echo "gate: json contract"
 out=$(base $GATE check --action resize --vm example-vm --change CHG0030001 --json 2>/dev/null)
 [ "$(printf '%s' "$out" | jq -r .verdict 2>/dev/null)" = ALLOW ] && ok "json verdict ALLOW" || bad "json verdict ALLOW"
+
+echo "hardware walk: the fixed script is checksum-guarded"
+(cd hardware && shasum -a 256 -c MANIFEST.sha256 >/dev/null 2>&1) && ok "hardware/ladder.sh matches its manifest" || bad "hardware/ladder.sh does not match its manifest"
+cp -R hardware /tmp/m4a-hw-test.$$ && printf '\n# x' >> /tmp/m4a-hw-test.$$/ladder.sh && ! (cd /tmp/m4a-hw-test.$$ && shasum -a 256 -c MANIFEST.sha256 >/dev/null 2>&1) && ok "a modified ladder.sh is REFUSED by the manifest check" || bad "a modified ladder.sh was accepted"; rm -rf /tmp/m4a-hw-test.$$
+expect "azvm-stack refuses a missing --host" 1 bin/azvm-stack
+expect "azvm-stack refuses a malformed --host" 1 bin/azvm-stack --host "a b;rm -rf"
+if [ "$(uname -s)" = Darwin ]; then expect "azmac-doctor runs and exits 0 (no network)" 0 bin/azmac-doctor --no-network; fi
 
 echo "policy files are valid JSON"
 for f in policy/definitions/*.json policy/*.json; do [ -f "$f" ] || continue; jq -e . "$f" >/dev/null 2>&1 && ok "$f" || bad "$f"; done

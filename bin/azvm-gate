@@ -1,0 +1,35 @@
+#!/bin/bash
+# azvm-gate — ask the change gate whether an action may run right now. Makes no Azure calls.
+#
+#   azvm-gate check --action resize --vm my-vm --change CHG0030001 [--provider file|servicenow|none] [--json]
+#
+# Exit codes (the contract for ServiceNow flows, Azure Automation, pipelines):
+#   0  allowed            10  denied (reason printed)            2  bad usage or missing prerequisite
+. "$(dirname "$0")/../lib/common.sh"
+. "$(dirname "$0")/../lib/gate.sh"
+need jq
+
+ACTION=""; VM=""; JSON=0
+[ "${1:-}" = check ] && shift || { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --action)   ACTION="$2"; shift 2;;
+    --vm)       VM="$2"; shift 2;;
+    --change)   CHANGE_ID="$2"; shift 2;;
+    --provider) GATE_PROVIDER="$2"; shift 2;;
+    --json)     JSON=1; shift;;
+    *) echo "unknown option: $1" >&2; exit 2;;
+  esac
+done
+[ -n "$ACTION" ] && [ -n "$VM" ] || { echo "--action and --vm are required" >&2; exit 2; }
+export CHANGE_ID="${CHANGE_ID:-}" GATE_PROVIDER="${GATE_PROVIDER:-none}"
+
+m4a_gate "$ACTION" "$VM"; rc=$?
+verdict=ALLOW; [ "$rc" -eq 0 ] || verdict=DENY
+if [ "$JSON" = 1 ]; then
+  jq -n --arg v "$verdict" --arg a "$ACTION" --arg vm "$VM" --arg c "${CHANGE_ID:-}" --arg p "$GATE_PROVIDER" --arg r "$GATE_REASON" \
+     '{verdict:$v, action:$a, vm:$vm, change:$c, provider:$p, reason:$r}'
+else
+  printf '%s %s on %s (change %s, provider %s)%s\n' "$verdict" "$ACTION" "$VM" "${CHANGE_ID:-none}" "$GATE_PROVIDER" "${GATE_REASON:+ — $GATE_REASON}"
+fi
+exit "$rc"

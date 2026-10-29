@@ -1,0 +1,15 @@
+#!/bin/bash
+# After the resize: check every mount BY ITSELF and the service, in order. EDIT THE HOST, MOUNTS AND SERVICE.
+# A temp (resource) disk comes back empty after a resize; anything mounted beneath it needs its directory recreated.
+set -u
+HOST="${HOOK_SSH_TARGET:?set HOOK_SSH_TARGET}"
+SERVICE="${HOOK_SERVICE:?set HOOK_SERVICE}"
+MOUNTS="${HOOK_MOUNTS:-/data}"   # space-separated, parent mounts first
+# the VM may still be booting: wait for ssh
+for i in 1 2 3 4 5 6 7 8 9 10 11 12; do ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" true 2>/dev/null && break; sleep 10; done
+rc=0
+for m in $MOUNTS; do
+  if ssh -o BatchMode=yes "$HOST" "mountpoint -q $m"; then echo "MOUNTED     $m"; else echo "NOT MOUNTED $m"; rc=1; fi
+done
+[ "$rc" = 0 ] || { echo "a mount is missing: fix it before starting $SERVICE (see docs/LESSONS.md)"; exit 1; }
+ssh -o BatchMode=yes "$HOST" "sudo systemctl start $SERVICE; systemctl is-active $SERVICE"

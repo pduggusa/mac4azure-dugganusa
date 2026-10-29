@@ -1,0 +1,54 @@
+#!/bin/bash
+# azvm-quota — see and request vCPU quota. Needs: Reader to show; Quota Request Operator to request.
+#
+#   azvm-quota show    --location centralus [--subscription S]
+#   azvm-quota request --location centralus --family standardDASv5Family --limit 4 [--change CHG..] [--apply]
+#   azvm-quota status  --location centralus --request-id <guid>
+#
+# A quota of 0 in a VM family is invisible until you try to use it: the resize is refused at validation (nothing
+# changes) with a message that names the family. Audit the families you might move to BEFORE the change window.
+# Requests of a few cores are often approved quickly; that is not guaranteed.
+. "$(dirname "$0")/../lib/common.sh"
+. "$(dirname "$0")/../lib/gate.sh"
+need az jq
+
+SUBCMD="${1:-}"; [ -n "$SUBCMD" ] && shift
+LOC=""; SUB=""; FAMILY=""; LIMIT=""; REQ=""; APPLY=0; ASSUME_YES=0; VM="quota"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --location|-l) LOC="$2"; shift 2;; --subscription) SUB="$2"; shift 2;; --family) FAMILY="$2"; shift 2;; --limit) LIMIT="$2"; shift 2;;
+    --request-id) REQ="$2"; shift 2;; --change) CHANGE_ID="$2"; shift 2;; --apply) APPLY=1; shift;; --yes) ASSUME_YES=1; shift;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) die "unknown option: $1";;
+  esac
+done
+export CHANGE_ID="${CHANGE_ID:-}"
+[ -n "$LOC" ] || die "--location is required"
+m4a_require_subscription
+BASE="https://management.azure.com/subscriptions/$SUB_ID/providers/Microsoft.Compute/locations/$LOC/providers/Microsoft.Quota"
+
+case "$SUBCMD" in
+  show)
+    printf '%-44s %6s %6s %6s\n' family used limit free
+    az_ vm list-usage -l "$LOC" -o json | jq -r '.[] | select(.name.value | test("Family$|^cores$")) | [.name.value, .currentValue, .limit, ((.limit|tonumber)-(.currentValue|tonumber))] | @tsv' \
+      | sort -t$'\t' -k3,3nr | awk -F'\t' '{printf "%-44s %6s %6s %6s\n",$1,$2,$3,$4}' | head -40
+    echo; echo "(families with a limit of 0 are listed last in a full listing; filter with: azvm-quota show ... | grep -i <family>)";;
+  request)
+    [ -n "$FAMILY" ] && [ -n "$LIMIT" ] || die "--family and --limit are required"
+    printf '%s' "$LIMIT" | grep -Eq '^[0-9]+$' || die "--limit must be a whole number"
+    echo "Quota request: family $FAMILY -> $LIMIT vCPUs in $LOC (subscription '$SUB_NAME')"
+    GATE_PROVIDER="${GATE_PROVIDER:-none}"; m4a_gate quota "$VM"; GRC=$?
+    if [ "$APPLY" != 1 ]; then echo "DRY RUN: nothing requested. Gate would say: $([ $GRC = 0 ] && echo ALLOW || echo "DENY ($GATE_REASON)")"; exit 0; fi
+    [ "$GRC" = 0 ] || { m4a_audit quota denied "$GATE_REASON"; die "change gate DENIED: $GATE_REASON"; }
+    [ "$ASSUME_YES" = 1 ] && [ "$GATE_PROVIDER" = none ] && die "--yes requires a real change gate"
+    m4a_confirm_typed "$FAMILY"
+    out=$(az_ rest --method put --url "$BASE/quotas/$FAMILY?api-version=2023-02-01" \
+      --body "{\"properties\":{\"limit\":{\"limitObjectType\":\"LimitValue\",\"value\":$LIMIT},\"name\":{\"value\":\"$FAMILY\"}}}" -o json 2>&1) \
+      || { m4a_audit quota failed "family=$FAMILY"; die "request failed: $(printf '%s' "$out" | head -c 300)"; }
+    m4a_audit quota ok "family=$FAMILY limit=$LIMIT"
+    printf '%s' "$out" | jq -r '"state: \(.properties.provisioningState)  request id: \(.name)"';;
+  status)
+    [ -n "$REQ" ] || die "--request-id is required"
+    az_ rest --method get --url "$BASE/quotaRequests/$REQ?api-version=2023-02-01" -o json | jq -r '"state: \(.properties.provisioningState)  limit: \(.properties.value[0].limit.value // "n/a")  message: \(.properties.error.message // "-")"';;
+  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 2;;
+esac

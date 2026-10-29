@@ -1,0 +1,9 @@
+{
+  "change_id": "CHG0030001",
+  "state": "implement",
+  "window_start": "2026-11-03T02:00:00Z",
+  "window_end": "2026-11-03T04:00:00Z",
+  "vm": "example-vm",
+  "actions": ["snapshot", "resize"],
+  "approved_by": "change-manager@example.com"
+}

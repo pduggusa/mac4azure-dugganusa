@@ -1,0 +1,30 @@
+{
+  "name": "m4a-vm-governance-tags",
+  "properties": {
+    "displayName": "mac4azure: VMs must carry governance tags (maintenance-window, owner, workload)",
+    "description": "A change process needs to know when a VM may be touched, who owns it, and what kind of workload it runs. Audits (or denies) VMs missing any of the tags maintenance-window, owner, workload.",
+    "mode": "Indexed",
+    "metadata": { "category": "Compute", "version": "1.0.0", "source": "mac4azure-dugganusa" },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "metadata": { "displayName": "Effect", "description": "Audit reports; Deny blocks creation of VMs without the tags." },
+        "allowedValues": ["Audit", "Deny", "Disabled"],
+        "defaultValue": "Audit"
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          { "field": "type", "equals": "Microsoft.Compute/virtualMachines" },
+          { "anyOf": [
+            { "field": "tags['maintenance-window']", "exists": "false" },
+            { "field": "tags['owner']", "exists": "false" },
+            { "field": "tags['workload']", "exists": "false" }
+          ] }
+        ]
+      },
+      "then": { "effect": "[parameters('effect')]" }
+    }
+  }
+}

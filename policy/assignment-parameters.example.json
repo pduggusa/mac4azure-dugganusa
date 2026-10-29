@@ -1,0 +1,3 @@
+{
+  "allowedVmSizes": { "value": ["Standard_D2as_v5", "Standard_D4as_v5", "Standard_D4as_v4"] }
+}

@@ -1,0 +1,50 @@
+#!/bin/bash
+# azvm-metrics — which layer is actually at its ceiling? Read-only. Needs: Monitoring Reader.
+#
+#   azvm-metrics --vm my-vm [--resource-group rg] [--hours 24] [--subscription S] [--fail-on-cap]
+#
+# Prints, for the VM-level disk caps, the data-disk caps and CPU: the average of the hourly averages and the
+# highest hourly maximum, as a percent of each layer's own limit. A VM-level row at ~100% means the VM SIZE is
+# the ceiling, and no amount of disk striping or disk upsizing will lift it (docs/LESSONS.md).
+# Platform metrics are free and retained 93 days (Microsoft Learn: Azure Monitor metrics).
+# Exit: always 0, except 3 with --fail-on-cap when any layer peaked at >= 95% (for pipelines).
+. "$(dirname "$0")/../lib/common.sh"
+need az jq
+
+VM=""; RG=""; SUB=""; HOURS=24; FAILCAP=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vm) VM="$2"; shift 2;; --resource-group|-g) RG="$2"; shift 2;; --subscription) SUB="$2"; shift 2;;
+    --hours) HOURS="$2"; shift 2;; --fail-on-cap) FAILCAP=1; shift;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) die "unknown option: $1";;
+  esac
+done
+m4a_require_subscription; m4a_resolve_vm
+VMID=$(az_ vm show -g "$RG" -n "$VM" --query id -o tsv) || die "VM not found"
+TMP=$(mktemp); trap 'rm -f "$TMP"' EXIT
+
+az_ monitor metrics list --resource "$VMID" \
+  --metric "VM Uncached Bandwidth Consumed Percentage" "VM Uncached IOPS Consumed Percentage" \
+           "Data Disk Bandwidth Consumed Percentage" "Data Disk IOPS Consumed Percentage" "Percentage CPU" \
+  --interval PT1H --aggregation Average Maximum --offset "${HOURS}h" -o json > "$TMP" 2>/dev/null \
+  || die "metrics query failed (need Monitoring Reader on the VM)"
+
+printf '%s  |  last %sh, hourly samples, percent of each layer'"'"'s own limit\n' "$VM" "$HOURS"
+printf '%-46s %8s %8s\n' "layer" "avg" "peak"
+CAPPED=0
+for m in "VM Uncached Bandwidth Consumed Percentage" "VM Uncached IOPS Consumed Percentage" \
+         "Data Disk Bandwidth Consumed Percentage" "Data Disk IOPS Consumed Percentage" "Percentage CPU"; do
+  row=$(jq -r --arg m "$m" '
+    .value[] | select(.name.value == $m) | .timeseries[0].data
+    | [ ([.[].average] | map(select(. != null))), ([.[].maximum] | map(select(. != null))) ]
+    | if (.[0] | length) == 0 then "n/a n/a" else "\((.[0] | add / length) | . * 10 | floor / 10) \(.[1] | max | . * 10 | floor / 10)" end' "$TMP" 2>/dev/null)
+  [ -n "$row" ] || row="n/a n/a"
+  avg=${row% *}; peak=${row#* }
+  flag=""
+  case "$peak" in n/a) ;; *) if [ "$(printf '%.0f' "$peak")" -ge 95 ]; then flag="  <-- AT CAP"; CAPPED=1; fi;; esac
+  printf '%-46s %7s%% %7s%%%s\n' "$m" "$avg" "$peak" "$flag"
+done
+[ "$CAPPED" = 1 ] && echo && echo "A layer peaked at >= 95%. If it is a VM-level row, change the VM size, not the disks."
+[ "$FAILCAP" = 1 ] && [ "$CAPPED" = 1 ] && exit 3
+exit 0

@@ -1,0 +1,8 @@
+#!/bin/bash
+# Stop the application cleanly before the VM changes size. EDIT THE HOST AND SERVICE.
+# Uses the VM's own ssh access; no secret is read or printed here.
+set -eu
+HOST="${HOOK_SSH_TARGET:?set HOOK_SSH_TARGET, for example azureuser@203.0.113.10}"
+SERVICE="${HOOK_SERVICE:?set HOOK_SERVICE, for example myapp}"
+echo "stopping $SERVICE on $HOST"
+ssh -o BatchMode=yes -o ConnectTimeout=20 "$HOST" "sudo systemctl stop $SERVICE; systemctl is-active $SERVICE || true; sync"

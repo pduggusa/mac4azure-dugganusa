@@ -1,0 +1,67 @@
+#!/bin/bash
+# azvm-policy — express the right-sizing process as Azure Policy. Plan by default.
+# Needs: Reader to plan; Resource Policy Contributor to apply.
+#
+#   azvm-policy plan  [--subscription S]
+#   azvm-policy apply [--subscription S] [--change CHG..] [--apply] [--assign --scope <scope> --params policy/assignment-parameters.json [--enforce]]
+#
+# Creates three custom definitions (governance tags, burstable-vs-sustained, static public IPs) and one initiative that
+# also references three BUILT-IN policies (allowed VM sizes, periodic update assessment, VM backup). Assignment is
+# optional and defaults to DoNotEnforce, so it reports and blocks nothing until you choose --enforce.
+# Status: the rules were checked against the live resource-provider aliases; creating them in a subscription has NOT been
+# exercised by us. Try it in a non-production subscription first.
+. "$(dirname "$0")/../lib/common.sh"
+. "$(dirname "$0")/../lib/gate.sh"
+need az jq
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+
+MODE="${1:-}"; [ -n "$MODE" ] && shift
+SUB=""; APPLY=0; ASSIGN=0; ENFORCE=0; SCOPE=""; PARAMS=""; ASSUME_YES=0; VM="policy"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --subscription) SUB="$2"; shift 2;; --change) CHANGE_ID="$2"; shift 2;; --apply) APPLY=1; shift;; --assign) ASSIGN=1; shift;;
+    --scope) SCOPE="$2"; shift 2;; --params) PARAMS="$2"; shift 2;; --enforce) ENFORCE=1; shift;; --yes) ASSUME_YES=1; shift;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) die "unknown option: $1";;
+  esac
+done
+export CHANGE_ID="${CHANGE_ID:-}"
+m4a_require_subscription
+
+SETNAME="m4a-vm-right-sizing"
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+sed "s/{{SUB_ID}}/$SUB_ID/g" "$HERE/policy/initiative.template.json" > "$TMP/defs.json"
+
+echo "Policy plan for subscription '$SUB_NAME':"
+for f in "$HERE"/policy/definitions/*.json; do
+  n=$(jq -r .name "$f"); printf '  define  %-28s %s\n' "$n" "$(jq -r .properties.displayName "$f" | cut -c1-70)"
+done
+echo "  define  initiative $SETNAME (3 custom + 3 built-in: allowed sizes, update assessment, VM backup)"
+[ "$ASSIGN" = 1 ] && echo "  assign  $SETNAME at ${SCOPE:-<--scope required>}  ($([ $ENFORCE = 1 ] && echo ENFORCED || echo DoNotEnforce))"
+
+[ "$MODE" = plan ] && { echo; echo "PLAN ONLY: nothing created."; exit 0; }
+[ "$MODE" = apply ] || { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+GATE_PROVIDER="${GATE_PROVIDER:-none}"; m4a_gate policy "$VM"; GRC=$?
+if [ "$APPLY" != 1 ]; then echo; echo "DRY RUN: nothing created. Gate would say: $([ $GRC = 0 ] && echo ALLOW || echo "DENY ($GATE_REASON)")"; exit 0; fi
+[ "$GRC" = 0 ] || { m4a_audit policy denied "$GATE_REASON"; die "change gate DENIED: $GATE_REASON"; }
+[ "$ASSUME_YES" = 1 ] && [ "$GATE_PROVIDER" = none ] && die "--yes requires a real change gate"
+m4a_confirm_typed "$SUB_NAME"
+
+for f in "$HERE"/policy/definitions/*.json; do
+  n=$(jq -r .name "$f")
+  jq .properties.policyRule "$f" > "$TMP/rule.json"; jq .properties.parameters "$f" > "$TMP/params.json"
+  az_ policy definition create --name "$n" --display-name "$(jq -r .properties.displayName "$f")" \
+    --description "$(jq -r .properties.description "$f")" --mode "$(jq -r .properties.mode "$f")" \
+    --rules "$TMP/rule.json" --params "$TMP/params.json" >/dev/null || die "failed to create definition $n"
+  echo "  created definition $n"
+done
+az_ policy set-definition create --name "$SETNAME" --display-name "mac4azure: VM right-sizing governance" \
+  --definitions "$TMP/defs.json" --params "$HERE/policy/initiative.parameters.json" >/dev/null || die "failed to create the initiative"
+echo "  created initiative $SETNAME"
+if [ "$ASSIGN" = 1 ]; then
+  [ -n "$SCOPE" ] && [ -f "${PARAMS:-}" ] || die "--assign needs --scope and --params <file>"
+  az_ policy assignment create --name "$SETNAME" --policy-set-definition "$SETNAME" --scope "$SCOPE" --params "$PARAMS" \
+    --enforcement-mode "$([ $ENFORCE = 1 ] && echo Default || echo DoNotEnforce)" >/dev/null || die "failed to assign"
+  echo "  assigned at $SCOPE"
+fi
+m4a_audit policy ok "initiative=$SETNAME assign=$ASSIGN enforce=$ENFORCE"

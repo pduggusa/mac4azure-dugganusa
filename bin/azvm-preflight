@@ -1,0 +1,108 @@
+#!/bin/bash
+# azvm-preflight — every check we would want green BEFORE a resize, in one read-only pass.
+# Needs: Reader (plus Monitoring Reader is not required here).
+#
+#   azvm-preflight --vm my-vm --target-size Standard_D4as_v5 [--resource-group rg] [--subscription S] [--strict]
+#
+# Checks: VM and power state; hypervisor generation vs the target; public IP is static; resource locks;
+# whether Azure offers the target size without a deallocate; the target size is not restricted; quota headroom
+# in the target family AND the regional total; the temp (resource) disk, which a resize can WIPE; the disk
+# controller type. Exit: 0, or 1 with --strict when any check FAILs. WARN never fails a run.
+. "$(dirname "$0")/../lib/common.sh"
+need az jq
+
+VM=""; RG=""; SUB=""; TARGET=""; STRICT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vm) VM="$2"; shift 2;; --resource-group|-g) RG="$2"; shift 2;; --subscription) SUB="$2"; shift 2;;
+    --target-size) TARGET="$2"; shift 2;; --strict) STRICT=1; shift;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) die "unknown option: $1";;
+  esac
+done
+[ -n "$TARGET" ] || die "--target-size is required"
+m4a_require_subscription; m4a_resolve_vm
+
+P=0; W=0; F=0
+pass() { P=$((P+1)); printf '  [PASS] %s\n' "$*"; }
+warnx() { W=$((W+1)); printf '  [WARN] %s\n' "$*"; }
+fail() { F=$((F+1)); printf '  [FAIL] %s\n' "$*"; }
+
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+az_ vm show -g "$RG" -n "$VM" -d -o json > "$TMP/vm.json" 2>"$TMP/e" || die "VM not found or not readable: $(head -c 120 "$TMP/e")"
+LOC=$(jq -r .location "$TMP/vm.json"); CUR=$(jq -r .hardwareProfile.vmSize "$TMP/vm.json")
+printf 'Preflight: %s (%s, %s) %s -> %s\n' "$VM" "$RG" "$LOC" "$CUR" "$TARGET"
+
+# sku lookups for current and target, usage, resize options, locks (az calls kept to 2 at a time)
+( for t in 1 2; do az_ vm list-skus -l "$LOC" --size "$CUR" --resource-type virtualMachines -o json > "$TMP/cur.json" 2>/dev/null && [ -s "$TMP/cur.json" ] && break; sleep 4; done ) &
+( for t in 1 2; do az_ vm list-skus -l "$LOC" --size "$TARGET" --resource-type virtualMachines -o json > "$TMP/tgt.json" 2>/dev/null && [ -s "$TMP/tgt.json" ] && break; sleep 4; done ) &
+wait
+az_ vm list-usage -l "$LOC" -o json > "$TMP/usage.json" 2>/dev/null
+az_ vm list-vm-resize-options -g "$RG" -n "$VM" -o json > "$TMP/opts.json" 2>/dev/null
+az_ lock list -g "$RG" -o json > "$TMP/locks.json" 2>/dev/null
+
+PS=$(jq -r '.powerState // "unknown"' "$TMP/vm.json")
+case "$PS" in "VM running") pass "VM is running";; *) warnx "power state is '$PS'";; esac
+
+[ -s "$TMP/tgt.json" ] && jq -e '.[0]' "$TMP/tgt.json" >/dev/null 2>&1 || { fail "target size '$TARGET' is not offered in $LOC for this subscription (or the lookup failed; retry)"; echo; printf 'Result: %s pass, %s warn, %s fail\n' $P $W $F; [ "$STRICT" = 1 ] && exit 1; exit 0; }
+tcap() { jq -r --arg k "$1" '.[0].capabilities[] | select(.name==$k) | .value' "$TMP/tgt.json" | head -1; }
+ccap() { [ -s "$TMP/cur.json" ] && jq -r --arg k "$1" '.[0].capabilities[]? | select(.name==$k) | .value' "$TMP/cur.json" | head -1; }
+
+if [ "$(jq -r '.[0].restrictions | length' "$TMP/tgt.json")" = 0 ]; then pass "target size has no region/subscription restriction"; else fail "target size is RESTRICTED in $LOC for this subscription"; fi
+
+# generation: read from the VM's instance view (one retry; an empty answer is "unknown", never a verdict)
+GEN=""
+for t in 1 2; do
+  GEN=$(az_ vm get-instance-view -g "$RG" -n "$VM" --query instanceView.hyperVGeneration -o tsv 2>/dev/null)
+  [ -n "$GEN" ] && break; sleep 3
+done
+if [ -z "$GEN" ]; then fail "could not read the VM's hypervisor generation (transient az error?). Unknown is not a pass: rerun"
+else case ",$(tcap HyperVGenerations)," in *",$GEN,"*) pass "hypervisor generation $GEN is supported by the target";; *) fail "VM is generation '$GEN'; target supports: $(tcap HyperVGenerations)";; esac; fi
+
+# public IP static?
+NIC=$(jq -r '.networkProfile.networkInterfaces[0].id // empty' "$TMP/vm.json")
+PIP=""; [ -n "$NIC" ] && PIP=$(az_ network nic show --ids "$NIC" --query "ipConfigurations[0].publicIPAddress.id" -o tsv 2>/dev/null)
+if [ -n "$PIP" ]; then
+  ALLOC=$(az_ network public-ip show --ids "$PIP" --query publicIPAllocationMethod -o tsv 2>/dev/null)
+  if [ "$ALLOC" = Static ]; then pass "public IP is Static (survives a deallocate)"; else warnx "public IP allocation is '$ALLOC': a deallocate can change the address, and things may hard-code it"; fi
+else pass "no public IP attached"; fi
+
+# locks
+NL=$(jq '[.[] | select(.level=="ReadOnly")] | length' "$TMP/locks.json" 2>/dev/null || echo 0)
+NC=$(jq 'length' "$TMP/locks.json" 2>/dev/null || echo 0)
+if [ "${NL:-0}" -gt 0 ]; then fail "$NL ReadOnly lock(s) in the resource group: a resize will be refused"; elif [ "${NC:-0}" -gt 0 ]; then warnx "$NC CanNotDelete lock(s) in the resource group (resize allowed; deletes are not)"; else pass "no resource locks found in the resource group"; fi
+
+# resize without deallocate?
+if jq -e --arg t "$TARGET" '.[] | select(.name==$t)' "$TMP/opts.json" >/dev/null 2>&1; then pass "Azure offers $TARGET without deallocating (a reboot, not a rebuild)"; else warnx "$TARGET is NOT in the no-deallocate list: the resize needs a deallocate (azvm-resize --allow-deallocate); expect longer downtime"; fi
+
+# quota: family + regional total
+FAM=$(jq -r '.[0].family' "$TMP/tgt.json"); VC=$(tcap vCPUs); CURV=$(ccap vCPUs); CURFAM=$(jq -r '.[0].family // ""' "$TMP/cur.json" 2>/dev/null)
+FLEFT=$(jq -r --arg f "$FAM" '.[] | select(.name.value==$f) | ((.limit|tonumber)-(.currentValue|tonumber))' "$TMP/usage.json" | head -1)
+FLIM=$(jq -r --arg f "$FAM" '.[] | select(.name.value==$f) | .limit' "$TMP/usage.json" | head -1)
+NEED=$VC; [ "$FAM" = "$CURFAM" ] && NEED=$(( VC - ${CURV:-0} ))
+if [ -z "$FLEFT" ]; then warnx "no quota row found for family $FAM"
+elif [ "$FLEFT" -ge "$NEED" ]; then pass "family quota OK: $FAM has $FLEFT of $FLIM vCPUs free, need $NEED"
+else fail "family quota too low: $FAM has $FLEFT of ${FLIM:-0} vCPUs free, need $NEED. Request it first (azvm-quota request): refusal happens at validation and changes nothing"; fi
+RLEFT=$(jq -r '.[] | select(.name.value=="cores") | ((.limit|tonumber)-(.currentValue|tonumber))' "$TMP/usage.json" | head -1)
+RNEED=$(( VC - ${CURV:-0} )); [ "$RNEED" -lt 0 ] && RNEED=0
+if [ -n "$RLEFT" ] && [ "$RLEFT" -lt "$RNEED" ]; then fail "regional vCPU total: $RLEFT free, need $RNEED more"; elif [ -n "$RLEFT" ]; then pass "regional vCPU total OK ($RLEFT free)"; fi
+
+# temp disk
+CT=$(ccap MaxResourceVolumeMB); TT=$(tcap MaxResourceVolumeMB)
+if [ "${CT:-0}" -gt 0 ] || [ "${TT:-0}" -gt 0 ]; then
+  warnx "temp (resource) disk: current ${CT:-0} MB, target ${TT:-0} MB. It is EPHEMERAL and is recreated EMPTY on resize. Nothing may live on it, including mountpoint directories beneath it (docs/LESSONS.md)"
+else pass "neither size has a temp disk"; fi
+
+# controller type
+DC=$(tcap DiskControllerTypes); [ -n "$DC" ] && case "$DC" in *NVMe*SCSI*|*SCSI*NVMe*) pass "target supports SCSI and NVMe disk controllers ($DC)";; *NVMe*) warnx "target is NVMe-only for disks ($DC): confirm the OS image supports it before resizing";; *) pass "disk controller: $DC";; esac
+
+# governance tags (informational)
+for t in maintenance-window owner workload; do
+  v=$(jq -r --arg t "$t" '.tags[$t] // empty' "$TMP/vm.json"); [ -n "$v" ] && printf '  [INFO] tag %s=%s\n' "$t" "$v" || printf '  [INFO] tag %s is not set (see docs/POLICIES.md)\n' "$t"
+done
+
+echo
+printf 'Result: %s pass, %s warn, %s fail\n' $P $W $F
+[ "$F" -gt 0 ] && echo "Do not apply while any check FAILs."
+[ "$STRICT" = 1 ] && [ "$F" -gt 0 ] && exit 1
+exit 0

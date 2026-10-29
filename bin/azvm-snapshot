@@ -1,0 +1,70 @@
+#!/bin/bash
+# azvm-snapshot — incremental snapshots of every disk on a VM, with an optional restore test.
+# Dry run by default. Needs: Disk Snapshot Contributor (snapshots) and Virtual Machine Contributor (the restore test
+# creates and deletes a temporary disk).
+#
+#   azvm-snapshot --vm my-vm [--resource-group rg] [--subscription S] [--change CHG0030001] [--restore-test] [--apply] [--yes]
+#
+# A snapshot is not a backup until it has restored. --restore-test creates a temporary disk from each snapshot,
+# compares its size in bytes to the source disk, and deletes it (also on failure). That proves the block copy only;
+# a full drill (scratch VM, start the service, compare application counts) proves the rest.
+# Incremental snapshots are billed for changed blocks, not a full copy (Microsoft Learn: incremental snapshots).
+. "$(dirname "$0")/../lib/common.sh"
+. "$(dirname "$0")/../lib/gate.sh"
+need az jq
+
+VM=""; RG=""; SUB=""; APPLY=0; RT=0; ASSUME_YES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vm) VM="$2"; shift 2;; --resource-group|-g) RG="$2"; shift 2;; --subscription) SUB="$2"; shift 2;;
+    --change) CHANGE_ID="$2"; shift 2;; --restore-test) RT=1; shift;; --apply) APPLY=1; shift;; --yes) ASSUME_YES=1; shift;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) die "unknown option: $1";;
+  esac
+done
+export CHANGE_ID="${CHANGE_ID:-}"
+m4a_require_subscription; m4a_resolve_vm
+
+TMP=$(mktemp -d); CLEAN_DISKS=""
+cleanup() { for d in $CLEAN_DISKS; do az_ disk delete -g "$RG" -n "$d" --yes >/dev/null 2>&1; done; rm -rf "$TMP"; }
+trap cleanup EXIT
+
+az_ vm show -g "$RG" -n "$VM" -o json > "$TMP/vm.json" 2>/dev/null || die "VM not found"
+LOC=$(jq -r .location "$TMP/vm.json")
+# label|disk id, one per line: the OS disk, then each data disk
+jq -r '(["os|" + .storageProfile.osDisk.managedDisk.id]) + [.storageProfile.dataDisks[] | "lun" + (.lun|tostring) + "|" + .managedDisk.id] | .[]' "$TMP/vm.json" > "$TMP/disks.txt"
+TS=$(date -u +%Y%m%d%H%M)
+
+echo "Snapshot plan for $VM ($RG, $LOC), subscription '$SUB_NAME':"
+while IFS='|' read -r label id; do printf '  %-6s %s -> m4a-%s-%s-%s\n' "$label" "$(basename "$id")" "$VM" "$label" "$TS"; done < "$TMP/disks.txt"
+[ "$RT" = 1 ] && echo "  then: restore-test each (temporary disk from snapshot, size compare, delete)"
+
+GATE_PROVIDER="${GATE_PROVIDER:-none}"
+m4a_gate snapshot "$VM"; GRC=$?
+if [ "$APPLY" != 1 ]; then
+  echo; echo "DRY RUN: nothing created. Gate would say: $([ $GRC = 0 ] && echo ALLOW || echo "DENY ($GATE_REASON)")"
+  echo "Re-run with --apply to create."; exit 0
+fi
+[ "$GRC" = 0 ] || { m4a_audit snapshot denied "$GATE_REASON"; die "change gate DENIED: $GATE_REASON"; }
+[ "$ASSUME_YES" = 1 ] && [ "$GATE_PROVIDER" = none ] && die "--yes requires a real change gate (GATE_PROVIDER=file|servicenow)"
+m4a_confirm_typed "$VM"
+
+FAILED=0
+while IFS='|' read -r label id; do
+  name="m4a-$VM-$label-$TS"
+  if az_ snapshot create -g "$RG" -n "$name" --source "$id" --incremental true --sku Standard_LRS \
+       --tags created-by=mac4azure change="${CHANGE_ID:-none}" source-vm="$VM" >/dev/null 2>"$TMP/err"; then
+    state=$(az_ snapshot show -g "$RG" -n "$name" --query provisioningState -o tsv)
+    printf '  created %s (%s)\n' "$name" "$state"
+    if [ "$RT" = 1 ]; then
+      rt="m4a-rt-$VM-$label-$TS"; CLEAN_DISKS="$CLEAN_DISKS $rt"
+      if az_ disk create -g "$RG" -n "$rt" --source "$name" --sku Standard_LRS >/dev/null 2>"$TMP/err"; then
+        a=$(az_ disk show --ids "$id" --query diskSizeBytes -o tsv); b=$(az_ disk show -g "$RG" -n "$rt" --query diskSizeBytes -o tsv)
+        if [ "$a" = "$b" ]; then printf '    restore-test OK: %s bytes match the source\n' "$a"; else printf '    restore-test FAILED: source %s bytes, restored %s\n' "$a" "$b"; FAILED=1; fi
+        az_ disk delete -g "$RG" -n "$rt" --yes >/dev/null 2>&1 && CLEAN_DISKS=$(printf '%s' "$CLEAN_DISKS" | sed "s/ $rt//")
+      else printf '    restore-test FAILED to create a disk: %s\n' "$(head -c 160 "$TMP/err")"; FAILED=1; fi
+    fi
+  else printf '  FAILED %s: %s\n' "$name" "$(head -c 200 "$TMP/err")"; FAILED=1; fi
+done < "$TMP/disks.txt"
+m4a_audit snapshot "$([ $FAILED = 0 ] && echo ok || echo failed)" "ts=$TS restore_test=$RT"
+exit "$FAILED"

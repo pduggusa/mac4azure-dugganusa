@@ -1,0 +1,9 @@
+{
+  "allowedVmSizes": {
+    "type": "Array",
+    "metadata": {
+      "displayName": "Allowed VM sizes",
+      "description": "The sizes your change process has approved. Supply the list when assigning; there is deliberately no default."
+    }
+  }
+}

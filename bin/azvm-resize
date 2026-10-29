@@ -1,0 +1,92 @@
+#!/bin/bash
+# azvm-resize — change a VM's size the safe way. Dry run by default. Needs: Virtual Machine Contributor
+# (+ Disk Snapshot Contributor for the snapshot step, Reader for preflight).
+#
+#   azvm-resize --vm my-vm --target-size Standard_D4as_v4 [--resource-group rg] [--subscription S]
+#               [--change CHG0030001] [--pre-hook NAME] [--post-hook NAME] [--allow-deallocate]
+#               [--skip-snapshot] [--apply] [--yes]
+#
+# Order: preflight (any FAIL blocks) -> change gate (a real change + window, see docs/SAFETY.md) -> typed
+# confirmation of the VM name -> incremental snapshots with a restore test -> pre-hook -> resize -> poll until the
+# size and power state are right -> post-hook -> print the rollback command. Every apply is written to the audit log.
+# Hooks are files in this repo's hooks/ directory (executable, no path separators in the name): never a shell string.
+# There is no automatic rollback: a resize is reversible by running the printed command, a decision for a human.
+. "$(dirname "$0")/../lib/common.sh"
+. "$(dirname "$0")/../lib/gate.sh"
+need az jq
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+
+VM=""; RG=""; SUB=""; TARGET=""; APPLY=0; ASSUME_YES=0; PRE=""; POST=""; DEALLOC=0; SKIPSNAP=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vm) VM="$2"; shift 2;; --resource-group|-g) RG="$2"; shift 2;; --subscription) SUB="$2"; shift 2;;
+    --target-size) TARGET="$2"; shift 2;; --change) CHANGE_ID="$2"; shift 2;; --pre-hook) PRE="$2"; shift 2;; --post-hook) POST="$2"; shift 2;;
+    --allow-deallocate) DEALLOC=1; shift;; --skip-snapshot) SKIPSNAP=1; shift;; --apply) APPLY=1; shift;; --yes) ASSUME_YES=1; shift;;
+    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) die "unknown option: $1";;
+  esac
+done
+[ -n "$TARGET" ] || die "--target-size is required"
+export CHANGE_ID="${CHANGE_ID:-}" GATE_PROVIDER="${GATE_PROVIDER:-none}"
+m4a_require_subscription; m4a_resolve_vm
+
+run_hook() { # name phase
+  [ -n "$1" ] || return 0
+  case "$1" in */*|.*) die "hook name must be a plain file name in hooks/";; esac
+  [ -f "$HERE/hooks/$1" ] && [ -x "$HERE/hooks/$1" ] || die "hook '$1' not found or not executable in hooks/"
+  echo "  hook $2: $1"
+  VM="$VM" RG="$RG" TARGET="$TARGET" CURRENT="$CUR" PHASE="$2" "$HERE/hooks/$1" || return 1
+}
+
+CUR=$(az_ vm show -g "$RG" -n "$VM" --query hardwareProfile.vmSize -o tsv) || die "VM not found"
+[ "$CUR" != "$TARGET" ] || die "VM is already $TARGET"
+echo "Resize plan: $VM ($RG)  $CUR -> $TARGET   subscription '$SUB_NAME'   change '${CHANGE_ID:-none}'"
+echo; echo "1. Preflight"
+PRE_OUT=$("$HERE/bin/azvm-preflight" --vm "$VM" --resource-group "$RG" --subscription "$SUB" --target-size "$TARGET" --strict 2>&1); PRC=$?
+printf '%s\n' "$PRE_OUT" | sed 's/^/   /'
+
+m4a_gate resize "$VM"; GRC=$?
+echo; echo "2. Change gate ($GATE_PROVIDER): $([ $GRC = 0 ] && echo ALLOW || echo "DENY: $GATE_REASON")"
+echo; echo "3. Then, in order (apply only):"
+[ "$SKIPSNAP" = 1 ] && echo "   - snapshot: SKIPPED by flag (logged)" || echo "   - incremental snapshots of every disk, with a restore test"
+[ -n "$PRE" ] && echo "   - pre-hook: $PRE"
+echo "   - $([ "$DEALLOC" = 1 ] && echo "deallocate, resize, start" || echo "az vm resize (reboot, no deallocate)")"
+echo "   - poll until size = $TARGET and the VM is running"
+[ -n "$POST" ] && echo "   - post-hook: $POST"
+echo "   - rollback: az vm resize -g $RG -n $VM --size $CUR --subscription $SUB_ID"
+
+if [ "$APPLY" != 1 ]; then echo; echo "DRY RUN: nothing changed. Re-run with --apply when preflight is clean and the gate says ALLOW."; exit 0; fi
+[ "$PRC" = 0 ] || { m4a_audit resize blocked "preflight failed"; die "preflight has FAILs; fix them first"; }
+[ "$GRC" = 0 ] || { m4a_audit resize denied "$GATE_REASON"; die "change gate DENIED: $GATE_REASON"; }
+[ "$ASSUME_YES" = 1 ] && [ "$GATE_PROVIDER" = none ] && die "--yes requires a real change gate (GATE_PROVIDER=file|servicenow)"
+NEEDS_DEALLOC=0
+az_ vm list-vm-resize-options -g "$RG" -n "$VM" --query "[?name=='$TARGET'].name" -o tsv 2>/dev/null | grep -q . || NEEDS_DEALLOC=1
+[ "$NEEDS_DEALLOC" = 1 ] && [ "$DEALLOC" != 1 ] && die "$TARGET needs a deallocate; re-run with --allow-deallocate if that downtime is in the window"
+
+m4a_confirm_typed "$VM"
+export M4A_PARENT_CONFIRMED=1
+echo; echo "== applying =="
+if [ "$SKIPSNAP" != 1 ]; then
+  "$HERE/bin/azvm-snapshot" --vm "$VM" --resource-group "$RG" --subscription "$SUB" --restore-test --apply || { m4a_audit resize aborted "snapshot or restore test failed"; die "snapshot or restore test failed; nothing was resized"; }
+fi
+run_hook "$PRE" pre || { m4a_audit resize aborted "pre-hook failed"; die "pre-hook failed; nothing was resized"; }
+
+if [ "$NEEDS_DEALLOC" = 1 ]; then
+  az_ vm deallocate -g "$RG" -n "$VM" >/dev/null && az_ vm resize -g "$RG" -n "$VM" --size "$TARGET" >/dev/null && az_ vm start -g "$RG" -n "$VM" >/dev/null || { m4a_audit resize failed "$CUR -> $TARGET"; die "resize sequence failed; check the VM state before anything else"; }
+else
+  az_ vm resize -g "$RG" -n "$VM" --size "$TARGET" >/dev/null || { m4a_audit resize failed "$CUR -> $TARGET"; die "az vm resize failed; the VM is unchanged unless Azure says otherwise (check its state)"; }
+fi
+
+i=0; OK=0
+while [ $i -lt 60 ]; do
+  row=$(az_ vm show -g "$RG" -n "$VM" -d --query "[hardwareProfile.vmSize, powerState]" -o tsv 2>/dev/null | tr '\n' ' ')
+  case "$row" in "$TARGET VM running "*) OK=1; break;; esac
+  i=$((i+1)); sleep 10
+done
+[ "$OK" = 1 ] || { m4a_audit resize unverified "$CUR -> $TARGET"; die "VM did not reach $TARGET + running within 10 minutes; inspect it. Rollback: az vm resize -g $RG -n $VM --size $CUR"; }
+echo "  VM is $TARGET and running."
+run_hook "$POST" post || warn "post-hook FAILED: the VM is resized; verify services by hand"
+m4a_audit resize ok "$CUR -> $TARGET"
+echo
+echo "Done. Now VERIFY by the artifact, not the exit code: every mount, every service, your own application counts."
+echo "Rollback if needed: az vm resize -g $RG -n $VM --size $CUR --subscription $SUB_ID"

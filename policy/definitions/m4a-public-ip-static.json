@@ -1,0 +1,26 @@
+{
+  "name": "m4a-public-ip-static",
+  "properties": {
+    "displayName": "mac4azure: public IP addresses must use Static allocation",
+    "description": "A deallocate (which some resizes require) can change a Dynamic public IP, and addresses end up hard-coded in DNS, firewall rules and configuration. Audits (or denies) Dynamic public IPs.",
+    "mode": "Indexed",
+    "metadata": { "category": "Network", "version": "1.0.0", "source": "mac4azure-dugganusa" },
+    "parameters": {
+      "effect": {
+        "type": "String",
+        "metadata": { "displayName": "Effect" },
+        "allowedValues": ["Audit", "Deny", "Disabled"],
+        "defaultValue": "Audit"
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          { "field": "type", "equals": "Microsoft.Network/publicIPAddresses" },
+          { "field": "Microsoft.Network/publicIPAddresses/publicIPAllocationMethod", "equals": "Dynamic" }
+        ]
+      },
+      "then": { "effect": "[parameters('effect')]" }
+    }
+  }
+}

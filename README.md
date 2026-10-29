@@ -55,6 +55,11 @@ There is no bypass flag. The emergency path is a human using `az` directly under
 - [docs/LESSONS.md](docs/LESSONS.md): the traps we hit (ephemeral temp disks, mount order, quota, caps)
 - [docs/CLAUDE-HOWTO.md](docs/CLAUDE-HOWTO.md) and [CLAUDE.md](CLAUDE.md): driving this with Claude Code safely
 
+## Background reading
+
+- [How To Architect on Azure: Uptime Is the Wrong Humble-Brag](https://www.dugganusa.com/post/how-to-architect-on-azure-uptime-is-the-wrong-humble-brag): how we troubleshoot, and the free Azure features that keep a VM honest
+- [Why I'd Never Manage Azure from a PC](https://www.dugganusa.com/post/why-i-d-never-manage-azure-from-a-pc): why the Azure management plane does not need Windows, what our research says about who attackers write for, and where Windows still wins
+
 ## Honest status
 
 Read-only paths, the dry runs and the refusal behavior were exercised against a real subscription. The offline test suite (`tests/run-tests.sh`, 36 checks) covers the gate. The `--apply` paths mirror a manual runbook we executed once on a production VM, but **the scripted apply paths have not been run end to end**, and the ServiceNow client and the policy creation have **not** been run against a live instance or subscription. Details and the full list are in [docs/TESTED-VERSIONS.md](docs/TESTED-VERSIONS.md). Try applies on a non-production VM first.
